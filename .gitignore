@@ -1,7 +1,8 @@
 # Secrets and local configuration
 .env
 .env.*
-!.env.example
+mailbox.txt
+mailbox*.txt
 .secret
 credentials.json
 cookies.json

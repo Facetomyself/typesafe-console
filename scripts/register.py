@@ -1,30 +1,170 @@
 #!/usr/bin/env python3
-"""Register a TypeSafe console account with a local Outlook mailbox and mint an API key."""
+"""Register a TypeSafe console account with Outlook mailbox OTP."""
 
 from __future__ import annotations
 
+import argparse
+import html
+import imaplib
 import json
-import subprocess
+import re
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
+from email import policy
+from email.header import decode_header, make_header
+from email.parser import BytesParser
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 from ruyipage import FirefoxOptions, FirefoxPage
 
-PY = r"D:\reverse_ENV\.venv\Scripts\python.exe"
-MAIL_CLI = r"D:\reverse_ENV\skill\outlook-mail-oauth\scripts\outlook_mail.py"
-FIREFOX = r"D:\reverse_ENV\tools\ruyipage\runtimes\151-proxy\firefox\firefox.exe"
-PICK = Path(r"D:\reverse_ENV\temp\typesafe-pick.json")
+PY_FIREFOX = r"D:\reverse_ENV\tools\ruyipage\runtimes\151-proxy\firefox\firefox.exe"
 DUMP = Path(r"D:\reverse_ENV\temp\typesafe-login")
 DUMP.mkdir(parents=True, exist_ok=True)
-STORAGE = Path(r"D:\reverse_ENV\storage\typesafe-console")
 LOGIN_URL = "https://console.typesafe.ai/login"
-KEYS_URL = "https://console.typesafe.ai/keys"
-KEY_NAME = "reverse-env"
+TOKEN_URL = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
+IMAP_HOST = "outlook.office365.com"
+IMAP_SCOPE = "offline_access https://outlook.office.com/IMAP.AccessAsUser.All"
+CODE_RE = re.compile(r"(?<!\d)(\d{6})(?!\d)")
+MAIL_MATCH = re.compile(r"typesafe|console\.typesafe", re.IGNORECASE)
+ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_MAILBOX = ROOT / "mailbox.txt"
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def parse_mailbox_txt(path: Path) -> dict[str, str]:
+    try:
+        lines = path.read_text(encoding="utf-8-sig").splitlines()
+    except OSError as exc:
+        raise RuntimeError(f"cannot read mailbox file: {path}") from exc
+    for number, line in enumerate(lines, start=1):
+        text = line.strip()
+        if not text or text.startswith("#") or text == "卡密导出":
+            continue
+        fields = text.split("----")
+        if len(fields) != 4 or not all(fields):
+            raise RuntimeError(f"invalid Outlook record at line {number}: expect email----password----client_id----refresh_token")
+        email, _password, client_id, refresh_token = fields
+        return {
+            "email": email.strip(),
+            "client_id": client_id.strip(),
+            "refresh_token": refresh_token.strip(),
+        }
+    raise RuntimeError("mailbox txt contains no Outlook records")
+
+
+def refresh_access_token(client_id: str, refresh_token: str) -> str:
+    body = urllib.parse.urlencode(
+        {
+            "client_id": client_id,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "scope": IMAP_SCOPE,
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        TOKEN_URL,
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:200]
+        raise RuntimeError(f"token refresh failed: {detail}") from exc
+    token = payload.get("access_token")
+    if not token:
+        raise RuntimeError("token refresh returned no access_token")
+    return token
+
+
+def imap_login(email: str, access_token: str) -> imaplib.IMAP4_SSL:
+    client = imaplib.IMAP4_SSL(IMAP_HOST, 993, timeout=20)
+    payload = f"user={email}\x01auth=Bearer {access_token}\x01\x01".encode("utf-8")
+    client.authenticate("XOAUTH2", lambda _: payload)
+    return client
+
+
+def message_text(raw: bytes) -> tuple[str, datetime | None]:
+    parsed = BytesParser(policy=policy.default).parsebytes(raw)
+    parts: list[str] = []
+    for part in parsed.walk():
+        if part.get_content_disposition() == "attachment":
+            continue
+        if part.get_content_type() not in {"text/plain", "text/html"}:
+            continue
+        content = part.get_content()
+        parts.append(content if isinstance(content, str) else str(content))
+    body = "\n".join(parts)
+    subject = str(make_header(decode_header(parsed.get("Subject", ""))))
+    sender = str(make_header(decode_header(parsed.get("From", ""))))
+    received = parsed.get("Date", "")
+    try:
+        date = parsedate_to_datetime(received)
+        if date.tzinfo is None:
+            date = date.replace(tzinfo=timezone.utc)
+        received_at = date.astimezone(timezone.utc)
+    except (TypeError, ValueError, IndexError):
+        received_at = None
+    text = html.unescape(re.sub(r"<[^>]+>", " ", f"{subject} {sender} {body}"))
+    return text, received_at
+
+
+def folder_codes(client: imaplib.IMAP4_SSL, folder: str, after: datetime, limit: int = 20) -> list[str]:
+    status, _ = client.select(folder, readonly=True)
+    if status != "OK":
+        return []
+    status, values = client.uid("search", None, "ALL")
+    if status != "OK":
+        return []
+    found: list[str] = []
+    for uid in reversed((values[0] or b"").split()[-limit:]):
+        status, fetched = client.uid("fetch", uid, "(BODY.PEEK[])")
+        if status != "OK":
+            continue
+        raw = b"".join(item[1] for item in fetched if isinstance(item, tuple) and isinstance(item[1], bytes))
+        if not raw:
+            continue
+        text, received_at = message_text(raw)
+        if received_at is not None and received_at < after:
+            continue
+        if not MAIL_MATCH.search(text):
+            continue
+        match = CODE_RE.search(text)
+        if match:
+            found.append(match.group(1))
+    return found
+
+
+def poll_otp(email: str, client_id: str, refresh_token: str, after_iso: str, timeout: int = 180, interval: int = 5) -> str:
+    after = datetime.fromisoformat(after_iso.replace("Z", "+00:00"))
+    deadline = time.time() + timeout
+    print("[mail] polling IMAP")
+    while time.time() < deadline:
+        token = refresh_access_token(client_id, refresh_token)
+        client = imap_login(email, token)
+        try:
+            codes = folder_codes(client, "INBOX", after)
+            if not codes:
+                codes = folder_codes(client, "Junk", after)
+            if codes:
+                print("[mail] received code length", len(codes[0]))
+                return codes[0]
+        finally:
+            try:
+                client.logout()
+            except Exception:
+                pass
+        time.sleep(interval)
+    raise RuntimeError("no verification code")
 
 
 def dump_dom(page, name: str) -> dict:
@@ -63,9 +203,7 @@ def dump_dom(page, name: str) -> dict:
         """
     )
     (DUMP / f"{name}.json").write_text(json.dumps(snap, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(
-        f"[dom] {name} url={snap.get('url')} buttons={[b.get('text') for b in snap.get('buttons') or []]}"
-    )
+    print(f"[dom] {name} url={snap.get('url')}")
     return snap
 
 
@@ -78,41 +216,6 @@ def wait_url(page, pred, timeout=30) -> str:
             return url
         time.sleep(0.4)
     return url
-
-
-def mail_poll(email: str, after: str) -> str:
-    cmd = [
-        PY,
-        MAIL_CLI,
-        "mail",
-        "poll",
-        "--account",
-        email,
-        "--after",
-        after,
-        "--match",
-        "typesafe|TypeSafe|console.typesafe",
-        "--timeout",
-        "180",
-        "--interval",
-        "5",
-        "--include-junk",
-    ]
-    print("[mail] polling")
-    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
-    if proc.returncode != 0:
-        raise RuntimeError(proc.stderr or proc.stdout or f"mail poll exit {proc.returncode}")
-    data = json.loads(proc.stdout)
-    if data.get("status") != "received" or not data.get("codes"):
-        raise RuntimeError("no verification code")
-    first = data["codes"][0]
-    code = first.get("code") if isinstance(first, dict) else str(first)
-    print("[mail] received code length", len(str(code)))
-    (DUMP / "last-code-meta.json").write_text(
-        json.dumps({"length": len(str(code)), "status": data.get("status")}, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    return str(code)
 
 
 def logged_in(url: str) -> bool:
@@ -169,187 +272,23 @@ def finish_setup(page) -> None:
     dump_dom(page, "setup-done")
 
 
-def extract_api_key(page) -> str:
-    secret = page.run_js(
-        """
-        return (function() {
-          const reject = (v) => {
-            if (!v) return true;
-            if (v[0] === '{') return true;
-            if (v.indexOf('N4Ig') === 0) return true;
-            if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v)) return true;
-            return false;
-          };
-          const nodes = [...document.querySelectorAll('code, pre, input, textarea, [data-slot=input]')];
-          for (const e of nodes) {
-            const v = String(e.value || e.innerText || '').trim();
-            if (reject(v)) continue;
-            if (/^(ts_|sk_|tsk_|tsk-|ts-|sk-)/.test(v) && v.length >= 20) return v;
-            if (v.length >= 32 && /^[A-Za-z0-9._\\-]+$/.test(v) && !v.includes('http')) return v;
-          }
-          const body = document.body.innerText || '';
-          const patterns = [
-            /\\bts_[A-Za-z0-9._-]{16,}\\b/,
-            /\\bsk_[A-Za-z0-9._-]{16,}\\b/,
-            /\\btsk_[A-Za-z0-9._-]{16,}\\b/,
-            /\\bts-[A-Za-z0-9._-]{16,}\\b/
-          ];
-          for (const p of patterns) {
-            const m = body.match(p);
-            if (m && !reject(m[0])) return m[0];
-          }
-          return '';
-        })();
-        """
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Register a TypeSafe console account")
+    parser.add_argument(
+        "--mailbox",
+        default=str(DEFAULT_MAILBOX),
+        help="Outlook txt: email----password----client_id----refresh_token",
     )
-    return str(secret or "")
-
-
-def create_api_key(page) -> str:
-    enter = page.ele("text=Enter console", timeout=2)
-    if enter:
-        print("[keys] Enter console first")
-        enter.click()
-        wait_url(page, lambda u: "/hook" not in u, timeout=15)
-        time.sleep(1)
-    page.get(KEYS_URL, timeout=45)
-    wait_url(page, lambda u: "/keys" in u, timeout=20)
-    time.sleep(2)
-    dump_dom(page, "keys-before")
-    if "/login" in page.url:
-        raise RuntimeError(f"still on login when opening keys: {page.url}")
-    if "/hook" in page.url or "/setup/" in page.url:
-        raise RuntimeError(f"blocked before keys: {page.url}")
-
-    body = (dump_dom(page, "keys-quiz") or {}).get("bodyText") or ""
-    if "POP QUIZ" in body or "Can you chat with Jev" in body or "Can Jev talk" in body:
-        nos = page.eles("text=No")
-        print("[keys] No buttons", len(nos) if nos else 0)
-        if not nos:
-            raise RuntimeError("quiz No button missing")
-        target = nos[-1]
-        print("[keys] answering quiz with last No")
-        target.click()
-        deadline = time.time() + 15
-        while time.time() < deadline:
-            snap = dump_dom(page, "keys-quiz-wait")
-            text = snap.get("bodyText") or ""
-            if "POP QUIZ" not in text and "Waiting for your answer" not in text:
-                break
-            time.sleep(1)
-        dump_dom(page, "keys-quiz-after")
-        close_deadline = time.time() + 12
-        while time.time() < close_deadline:
-            snap = dump_dom(page, "keys-quiz-close-wait")
-            text = snap.get("bodyText") or ""
-            labels = [b.get("text") for b in snap.get("buttons") or []]
-            if "Close" in labels:
-                close_btn = page.ele("text=Close", timeout=2)
-                if close_btn:
-                    print("[keys] closing quiz overlay")
-                    close_btn.click()
-                    time.sleep(1.2)
-            if "POP QUIZ" not in text and "THAT’S CORRECT" not in text and "THAT'S CORRECT" not in text:
-                break
-            time.sleep(0.6)
-        if "/keys" not in (page.url or ""):
-            print("[keys] returning to keys after overlay", page.url)
-            page.get(KEYS_URL, timeout=45)
-            wait_url(page, lambda u: "/keys" in u, timeout=20)
-            time.sleep(1.2)
-        dump_dom(page, "keys-quiz-closed")
-
-    dialog = None
-    for attempt in range(4):
-        create_btn = page.ele("text=Create key", timeout=5)
-        if not create_btn:
-            raise RuntimeError("Create key button missing")
-        print("[keys] clicking Create key attempt", attempt)
-        create_btn.click()
-        wait_deadline = time.time() + 8
-        while time.time() < wait_deadline:
-            dialog = dump_dom(page, "keys-dialog")
-            inputs = dialog.get("inputs") or []
-            if inputs:
-                break
-            time.sleep(0.5)
-        if dialog and (dialog.get("inputs") or []):
-            break
-        time.sleep(0.8)
-    if not dialog or not (dialog.get("inputs") or []):
-        raise RuntimeError("Create key dialog did not open")
-    name_box = (
-        page.ele("#name", timeout=3)
-        or page.ele("css:input[name=name]", timeout=1)
-        or page.ele("css:input[type=text]", timeout=1)
-    )
-    if not name_box:
-        raise RuntimeError("key name input missing")
-    name_box.click()
-    time.sleep(0.2)
-    name_box.input(KEY_NAME)
-    time.sleep(0.4)
-    name_len = page.run_js(
-        "return (function(){ const e=document.querySelector('#name'); return e ? String(e.value||'').length : 0; })();"
-    )
-    print("[keys] name length", name_len)
-    if not name_len:
-        raise RuntimeError("key name did not stick")
-    creates = page.eles("text=Create key")
-    print("[keys] Create key buttons", len(creates) if creates else 0)
-    if not creates:
-        raise RuntimeError("Create key confirm missing")
-    print("[keys] confirm dialog Create key")
-    creates[-1].click()
-    secret = ""
-    deadline = time.time() + 20
-    while time.time() < deadline:
-        dump_dom(page, "keys-after")
-        secret = extract_api_key(page)
-        if secret:
-            break
-        copy_btn = page.ele("text=Copy", timeout=1) or page.ele("text=Copy key", timeout=0.5)
-        if copy_btn:
-            copy_btn.click()
-            time.sleep(0.4)
-            secret = extract_api_key(page)
-            if secret:
-                break
-        time.sleep(0.8)
-    if not secret or secret.startswith("{") or secret.startswith("N4Ig"):
-        raise RuntimeError("API key not visible after create")
-    print("[keys] secret length", len(secret))
-    return secret
-
-
-def save_account(email: str, api_key: str, after: str) -> Path:
-    STORAGE.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "email": email,
-        "api_key": api_key,
-        "console": LOGIN_URL,
-        "keys_url": KEYS_URL,
-        "created_at": utc_now(),
-        "mail_after": after,
-        "source": "outlook-mail-oauth",
-        "key_name": KEY_NAME,
-    }
-    path = STORAGE / "account.json"
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    (STORAGE / ".env").write_text(
-        f"TYPESAFE_EMAIL={email}\nTYPESAFE_API_KEY={api_key}\n",
-        encoding="utf-8",
-    )
-    print("[save]", path)
-    return path
+    return parser.parse_args()
 
 
 def main() -> None:
-    pick = json.loads(PICK.read_text(encoding="utf-8"))
-    email = pick["email"]
+    args = parse_args()
+    mailbox = parse_mailbox_txt(Path(args.mailbox))
+    email = mailbox["email"]
     profile = DUMP / f"profile-register-{int(time.time())}"
     opts = FirefoxOptions()
-    opts.set_browser_path(FIREFOX)
+    opts.set_browser_path(PY_FIREFOX)
     opts.set_user_dir(str(profile))
     page = FirefoxPage(opts)
     try:
@@ -359,9 +298,8 @@ def main() -> None:
         if on_setup(page.url):
             print("[resume] already on setup")
             accept_tos(page)
-            api_key = create_api_key(page)
-            save_account(email, api_key, utc_now())
-            print("[done] saved")
+            finish_setup(page)
+            print("[done] registered")
             return
         email_box = page.ele("#email", timeout=10)
         if not email_box:
@@ -375,7 +313,7 @@ def main() -> None:
         wait_url(page, lambda u: "otp=true" in u, timeout=15)
         time.sleep(1)
         dump_dom(page, "after-send")
-        code = mail_poll(email, after)
+        code = poll_otp(email, mailbox["client_id"], mailbox["refresh_token"], after)
         code_box = page.ele("#code", timeout=10)
         if not code_box:
             raise RuntimeError("code input missing")
@@ -394,9 +332,7 @@ def main() -> None:
             accept_tos(page)
         finish_setup(page)
         dump_dom(page, "after-onboarding")
-        api_key = create_api_key(page)
-        save_account(email, api_key, after)
-        print("[done] saved")
+        print("[done] registered")
     finally:
         try:
             page.browser.quit()
