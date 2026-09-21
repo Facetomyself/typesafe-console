@@ -1,0 +1,43 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+.secret
+credentials.json
+cookies.json
+cookie.json
+account.json
+mailboxes.json
+
+# Raw evidence and captures
+*.har
+*.pcap
+*.pcapng
+*.flow
+*.bin
+*.log
+
+# Generated trees
+raw/
+captures/
+runtime/
+artifacts/
+browser-profiles/
+profile-*/
+temp/
+
+# Local runtimes and caches
+.venv/
+venv/
+node_modules/
+__pycache__/
+.pytest_cache/
+.cache/
+dist/
+build/
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
